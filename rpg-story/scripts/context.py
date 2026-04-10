@@ -69,9 +69,9 @@ def init_campaign(campaign, system, setting, tone, char_name, archetype):
         "system": system,
         "setting": setting,
         "tone": tone,
-        "location": "起始区域",
+        "location": "starting_area",
         "time": "08:00",
-        "weather": "晴朗",
+        "weather": "clear",
         "flags": {}
     }
     save_json(path / "world.json", world)
@@ -81,8 +81,8 @@ def init_campaign(campaign, system, setting, tone, char_name, archetype):
         "name": char_name,
         "archetype": archetype,
         "stats": {
-            "生命值": {"current": 20, "max": 20},
-            "理智": {"current": 50, "max": 50}
+            "hp": {"current": 20, "max": 20},
+            "sanity": {"current": 50, "max": 50}
         },
         "inventory": [],
         "quests": []

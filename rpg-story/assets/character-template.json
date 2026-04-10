@@ -1,14 +1,14 @@
 {
-  "name": "玩家",
-  "class": "冒险者",
+  "name": "Player",
+  "class": "Adventurer",
   "level": 1,
   "stats": {
-    "力量": 10,
-    "敏捷": 10,
-    "体质": 10,
-    "智力": 10,
-    "感知": 10,
-    "魅力": 10
+    "STR": 10,
+    "DEX": 10,
+    "CON": 10,
+    "INT": 10,
+    "WIS": 10,
+    "CHA": 10
   },
   "hp": {
     "current": 10,
