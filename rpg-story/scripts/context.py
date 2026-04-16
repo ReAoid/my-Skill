@@ -132,11 +132,19 @@ def set_flag(campaign, key, value):
     path = get_campaign_path(campaign) / "world.json"
     world = load_json(path)
     
-    # 自动转换布尔值
-    if value.lower() == 'true': 
+    # 自动类型转换：布尔 → 整数 → 浮点数 → 字符串
+    if value.lower() == 'true':
         value = True
-    elif value.lower() == 'false': 
+    elif value.lower() == 'false':
         value = False
+    else:
+        try:
+            value = int(value)
+        except ValueError:
+            try:
+                value = float(value)
+            except ValueError:
+                pass  # 保持为字符串
     
     world.setdefault("flags", {})[key] = value
     save_json(path, world)
