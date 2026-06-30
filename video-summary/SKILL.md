@@ -205,7 +205,31 @@ yt-dlp --list-subs "视频URL"
 
 实时进度报告（每5秒输出百分比、已处理时间、片段数、预计剩余时间）。
 
-### Step 4b：长视频超时风险提示
+### Step 4b：国内镜像加速安装
+
+首次运行安装依赖时，如果下载速度慢（如 faster-whisper/torch 几百 MB），可以用 `--pip-mirror` 指定国内镜像源：
+
+```bash
+# 清华源（推荐）
+python -u <skill_dir>/scripts/bilibili_pipeline.py --pip-mirror https://pypi.tuna.tsinghua.edu.cn/simple
+
+# 阿里源
+python -u <skill_dir>/scripts/bilibili_pipeline.py --pip-mirror https://mirrors.aliyun.com/pypi/simple/
+
+# 中科大源
+python -u <skill_dir>/scripts/bilibili_pipeline.py --pip-mirror https://pypi.mirrors.ustc.edu.cn/simple/
+```
+
+也可以直接设置环境变量（pip 原生支持），效果相同：
+
+```bash
+set PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+python -u <skill_dir>/scripts/bilibili_pipeline.py
+```
+
+安装完成后再次运行就不需要 `--pip-mirror` 了，因为包已缓存到本地。
+
+### Step 4c：长视频超时风险提示
 
 单视频时长 > 900 秒（15分钟），脚本**自动打印超时风险提示**，建议在本地终端手动运行避免进程被杀：
 

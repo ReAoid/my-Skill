@@ -58,6 +58,7 @@ VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".flv", ".wmv", ".m4v", ".webm"}
 CONDA_ENV_NAME = "bilibili_trans"
 LONG_VIDEO_THRESHOLD = 900  # 15分钟
 BATCH_CONFIRM_THRESHOLD = 20
+PIP_MIRROR = "https://pypi.tuna.tsinghua.edu.cn/simple"  # pip 国内镜像（默认清华源）
 
 # macOS mlx-whisper 模型仓库映射
 MLX_MODEL_REPOS = {
@@ -75,110 +76,349 @@ _cached_model_key = None
 
 # ============ P0: Conda 环境检测 ============
 
+# ============ Conda 自举：自动创建环境 + 安装依赖 + 切换执行 ============
+
+def _conda_env_exists(env_name):
+    """检查指定名称的 conda 环境是否存在。"""
+    success, stdout, _ = run_command("conda env list", timeout=30)
+    if not success:
+        return False
+    for line in stdout.split('\n'):
+        stripped = line.strip()
+        if stripped.startswith(env_name) and not stripped.startswith("#"):
+            return True
+    return False
+
+
+def _run_with_live_output(cmd, timeout, label=""):
+    """
+    运行命令并实时流式输出，避免长时间静默无反馈。
+    每隔 15 秒无输出时自动打印一个进度提示。
+    正确处理 Ctrl+C，避免 Windows 弹 Terminate batch job 提示。
+    返回 (success, returncode)。
+    """
+    import threading
+
+    spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    spinner_idx = [0]
+    last_output_time = [time.time()]
+    done = [False]
+
+    def progress_spinner():
+        """后台线程：长时间无输出时打印进度提示。"""
+        while not done[0]:
+            elapsed = time.time() - last_output_time[0]
+            if elapsed > 15:
+                spinner = spinner_frames[spinner_idx[0] % len(spinner_frames)]
+                print(f"  {spinner} {label}... (已运行 {int(elapsed)} 秒，请耐心等待)", flush=True)
+                spinner_idx[0] += 1
+                last_output_time[0] = time.time()
+            time.sleep(2)
+
+    thread = threading.Thread(target=progress_spinner, daemon=True)
+    thread.start()
+
+    process = None
+    try:
+        process = subprocess.Popen(
+            cmd, shell=True,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            bufsize=0,
+            text=True,
+            errors="replace"
+        )
+
+        for line in iter(process.stdout.readline, ""):
+            line = line.rstrip()
+            if line:
+                print(f"  {line}", flush=True)
+                last_output_time[0] = time.time()
+                spinner_idx[0] = 0
+
+        returncode = process.wait(timeout=timeout)
+        return returncode == 0, returncode
+
+    except subprocess.TimeoutExpired:
+        if process:
+            process.kill()
+        print(f"  [超时] 命令执行超过 {timeout} 秒，已终止", flush=True)
+        return False, -1
+
+    except KeyboardInterrupt:
+        print()
+        print("  [取消] 用户中断，正在清理...", flush=True)
+        if process:
+            process.kill()
+        print()
+        sys.exit(130)
+
+    finally:
+        done[0] = True
+
+
+def _conda_install_ffmpeg(env_name):
+    """通过 conda 安装 ffmpeg 到目标环境。"""
+    print(f"  [安装] 安装 ffmpeg 到 {env_name}...", flush=True)
+    success, rc = _run_with_live_output(
+        f"conda install -n {env_name} ffmpeg -y", timeout=300, label="安装 ffmpeg"
+    )
+    if success:
+        print("  [OK] ffmpeg 安装完成", flush=True)
+    else:
+        print(f"  [警告] ffmpeg 安装失败 (返回码: {rc})", flush=True)
+
+
+_YT_DLP_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+
+def _yt_cmd(base_cmd):
+    """给 yt-dlp 命令加上 User-Agent + Referer + Cookie（防 B站 412 错误）。"""
+    # 构建请求头
+    headers = f'--user-agent "{_YT_DLP_UA}"'
+    headers += ' --add-header "Referer:https://www.bilibili.com"'
+    headers += ' --add-header "Origin:https://www.bilibili.com"'
+    # 自动检测 cookie.txt，存在则传入
+    for p in [Path.cwd() / "cookie.txt", Path(__file__).resolve().parent / "cookie.txt"]:
+        if p.exists():
+            headers += f' --cookies "{p}"'
+            break
+    return f'{base_cmd} {headers}'
+
+
+def _pip_mirror_flag():
+    """返回 pip -i 参数（如果配置了镜像源）。"""
+    mirror = PIP_MIRROR or os.environ.get("PIP_INDEX_URL", "")
+    return f" -i {mirror}" if mirror else ""
+
+
+def _conda_install_pip_deps(env_name):
+    """按系统自动安装 torch + whisper + funasr 等全部依赖（实时输出进度）。"""
+    system = platform.system()
+    is_as = (system == "Darwin" and platform.machine() == "arm64")
+    prefix = f"conda run -n {env_name}"
+
+    mirror = _pip_mirror_flag()
+
+    # 1. 基础包
+    print(f"  [安装] 安装基础 Python 包到 {env_name}...", flush=True)
+    _run_with_live_output(
+        f'{prefix} pip install yt-dlp opencc-python-reimplemented{mirror}',
+        timeout=120, label="基础包"
+    )
+    print()
+
+    # 2. torch + 转写引擎
+    if is_as:
+        print(f"  [安装] Apple Silicon: 安装 mlx-whisper + torch...", flush=True)
+        _run_with_live_output(
+            f'{prefix} pip install mlx-whisper torch torchvision torchaudio funasr modelscope soundfile{mirror}',
+            timeout=600, label="mlx-whisper + torch"
+        )
+    elif system == "Windows":
+        # 检测 CUDA
+        has_cuda = False
+        try:
+            r = subprocess.run("nvidia-smi", capture_output=True, timeout=10, shell=True)
+            has_cuda = r.returncode == 0
+        except Exception:
+            pass
+
+        if has_cuda:
+            print(f"  [安装] Windows CUDA: 安装 CUDA 版 torch...", flush=True)
+            _run_with_live_output(
+                f'{prefix} pip install torch==2.3.1+cu121 torchvision==0.18.1 torchaudio==2.3.1 --index-url https://download.pytorch.org/whl/cu121{mirror}',
+                timeout=600, label="CUDA torch"
+            )
+        else:
+            print(f"  [安装] Windows CPU: 安装 CPU 版 torch...", flush=True)
+            _run_with_live_output(
+                f'{prefix} pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu{mirror}',
+                timeout=600, label="CPU torch"
+            )
+        print(f"  [安装] 安装 faster-whisper + funasr...", flush=True)
+        _run_with_live_output(
+            f'{prefix} pip install faster-whisper funasr modelscope soundfile{mirror}',
+            timeout=600, label="faster-whisper + funasr"
+        )
+    else:
+        print(f"  [安装] 安装 faster-whisper + torch (CPU)...", flush=True)
+        _run_with_live_output(
+            f'{prefix} pip install faster-whisper torch torchvision torchaudio funasr modelscope soundfile{mirror}',
+            timeout=600, label="faster-whisper + torch"
+        )
+
+
+def _auto_install_python_deps():
+    """
+    已在目标 conda 环境内运行时，检查关键依赖，缺失则自动 pip install。
+    """
+    missing = []
+    try:
+        import yt_dlp
+    except ImportError:
+        missing.append("yt-dlp")
+    try:
+        import opencc
+    except ImportError:
+        missing.append("opencc-python-reimplemented")
+
+    if is_apple_silicon():
+        try:
+            import mlx_whisper
+        except ImportError:
+            missing.append("mlx-whisper")
+    else:
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError:
+            missing.append("faster-whisper")
+
+    # torch（GPU 加速核心）
+    try:
+        import torch
+    except ImportError:
+        missing.append("torch")
+
+    if missing:
+        pkgs_str = " ".join(missing)
+        mirror = _pip_mirror_flag()
+        print(f"  [自动] 检测到缺失依赖: {', '.join(missing)}，正在安装...", flush=True)
+        success, _ = _run_with_live_output(
+            f"pip install {pkgs_str}{mirror}",
+            timeout=600, label="安装依赖"
+        )
+        if success:
+            print("  [OK] 依赖安装完成", flush=True)
+        else:
+            print("  [警告] 部分依赖安装可能失败，请检查上方输出", flush=True)
+
+
+def _relaunch_in_env(env_name, script_args):
+    """
+    在指定 conda 环境中重新启动本脚本（通过 subprocess）。
+    当前进程退出，由新进程接管。
+    """
+    script_path = Path(__file__).resolve()
+    args_str = " ".join(script_args)
+    cmd = f'conda run -n {env_name} --no-capture-output python -u "{script_path}" {args_str}'
+    print(f"  [切换] 在 {env_name} 环境中重新启动...", flush=True)
+    print()
+    sys.stdout.flush()
+
+    ret = subprocess.run(cmd, shell=True)
+    sys.exit(ret.returncode)
+
+
 def check_conda_env():
-    """检测 Conda 环境，强制使用 Anaconda/Miniconda 虚拟环境。"""
+    """
+    Conda 环境自举检测：
+    1. conda 不存在 → 打印安装指引
+    2. 已在 bilibili_trans → 自动补齐缺失的 Python 依赖
+    3. bilibili_trans 不存在 → 询问是否自动创建 + 安装全部依赖
+    4. bilibili_trans 存在但未激活 → 自动切换到该环境执行
+    """
     conda_exe = shutil.which("conda") or shutil.which("conda.exe")
-    conda_env = os.environ.get("CONDA_DEFAULT_ENV", "")
+    current_env = os.environ.get("CONDA_DEFAULT_ENV", "")
 
     print("=" * 70)
-    print("  [环境校验] Conda 虚拟环境检测")
+    print("  [环境校验] Conda 虚拟环境自举")
     print("=" * 70)
 
+    # ── 场景 1: conda 未安装 ──
     if not conda_exe:
-        print("  [警告] 未检测到 conda 命令！")
+        print("  [需要操作] 未检测到 conda 命令！")
         print("  本工具仅支持 Anaconda/Miniconda 虚拟环境运行。")
         print()
-        _print_conda_install_guide()
-        print()
-        print("  请安装 Miniconda 后，创建并激活虚拟环境再运行本脚本。")
-        print("=" * 70)
-        print()
-        return False
-
-    print(f"  [OK] conda 已安装: {conda_exe}")
-
-    if not conda_env:
-        print("  [警告] 当前未激活 conda 虚拟环境！")
-        print(f"  请先激活 {CONDA_ENV_NAME} 环境再运行：")
-        _print_conda_activate_guide()
-        print()
-        print("  或使用以下命令一键创建并激活环境：")
-        _print_conda_create_guide()
-        print("=" * 70)
-        print()
-        return False
-
-    if conda_env != CONDA_ENV_NAME:
-        print(f"  [警告] 当前 conda 环境为 '{conda_env}'，推荐使用 '{CONDA_ENV_NAME}'")
-        print(f"  请切换环境: conda activate {CONDA_ENV_NAME}")
-        print("=" * 70)
-        print()
-        # 不强制退出，只是警告
-    else:
-        print(f"  [OK] 当前 conda 环境: {conda_env}")
-
-    print()
-    return True
-
-
-def _print_conda_install_guide():
-    """输出 Conda 安装指引（区分系统）。"""
-    system = platform.system()
-    print("  ┌─ Miniconda 安装指引 ──────────────────────────────")
-    if system == "Windows":
-        print("  │ 1. 下载安装包:")
-        print("  │    https://repo.anaconda.com/miniconda/Miniconda3-latest-Windows-x86_64.exe")
-        print("  │ 2. 安装时勾选 'Add Miniconda3 to my PATH'")
-        print("  │ 3. 重启终端，验证: conda --version")
-    elif system == "Darwin":
-        arch = platform.machine()
-        if arch == "arm64":
-            url = "https://repo.anaconda.com/miniconda/Miniconda3-latest-MacOSX-arm64.sh"
+        system = platform.system()
+        print("  ┌─ Miniconda 安装指引 ──────────────────────────────")
+        if system == "Windows":
+            print("  │ 1. 下载安装包:")
+            print("  │    https://repo.anaconda.com/miniconda/Miniconda3-latest-Windows-x86_64.exe")
+            print("  │ 2. 安装时勾选 'Add Miniconda3 to my PATH'")
+            print("  │ 3. 重启终端，验证: conda --version")
+        elif system == "Darwin":
+            arch = platform.machine()
+            url = "https://repo.anaconda.com/miniconda/Miniconda3-latest-MacOSX-arm64.sh" if arch == "arm64" else "https://repo.anaconda.com/miniconda/Miniconda3-latest-MacOSX-x86_64.sh"
+            print(f"  │ wget {url}")
+            print(f"  │ bash Miniconda3-latest-MacOSX-*.sh")
+            print("  │ conda init zsh")
+            print("  │ source ~/.zshrc")
         else:
-            url = "https://repo.anaconda.com/miniconda/Miniconda3-latest-MacOSX-x86_64.sh"
-        print(f"  │ wget {url}")
-        print(f"  │ bash Miniconda3-latest-MacOSX-*.sh")
-        print("  │ conda init zsh")
-        print("  │ source ~/.zshrc")
+            print("  │ 请访问 https://docs.conda.io/en/latest/miniconda.html")
+        print("  └──────────────────────────────────────────────────")
+        print()
+        print("  请安装 Miniconda 后重试。")
+        print("=" * 70)
+        print()
+        return False
+
+    print(f"  [OK] conda 已安装")
+
+    # ── 场景 2: 已在 bilibili_trans 环境中 ──
+    if current_env == CONDA_ENV_NAME:
+        print(f"  [OK] 当前 conda 环境: {CONDA_ENV_NAME}")
+        _auto_install_python_deps()
+        print()
+        return True
+
+    # ── 场景 3/4: 不在目标环境中 ──
+    env_exists = _conda_env_exists(CONDA_ENV_NAME)
+
+    if not env_exists:
+        # 场景 3: 环境不存在 → 询问创建
+        print(f"  [发现] 未找到 {CONDA_ENV_NAME} 虚拟环境")
+        print()
+        try:
+            resp = input("  是否自动创建并安装全部依赖? [Y/n]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            resp = "y"
+        print()
+
+        if resp not in ("", "y", "yes"):
+            print("  跳过自动配置。请手动执行：")
+            print(f"  conda create -n {CONDA_ENV_NAME} python=3.10 -y")
+            print(f"  conda activate {CONDA_ENV_NAME}")
+            print("  pip install yt-dlp opencc-python-reimplemented")
+            print("=" * 70)
+            print()
+            return False
+
+        # 自动创建环境
+        print(f"  [安装] 正在创建 conda 环境 {CONDA_ENV_NAME} (Python 3.10)...", flush=True)
+        success, rc = _run_with_live_output(
+            f"conda create -n {CONDA_ENV_NAME} python=3.10 -y",
+            timeout=300, label="创建环境"
+        )
+        if not success:
+            print(f"  [错误] 环境创建失败 (返回码: {rc})", flush=True)
+            print("=" * 70)
+            print()
+            return False
+        print(f"  [OK] 环境 {CONDA_ENV_NAME} 已创建", flush=True)
+
+        _conda_install_ffmpeg(CONDA_ENV_NAME)
+
+        print()
+        print("  [安装] 开始安装 Python 依赖（耗时较长，请耐心等待）...", flush=True)
+        _conda_install_pip_deps(CONDA_ENV_NAME)
+        print("  [OK] 全部依赖安装完成", flush=True)
+
     else:
-        print("  │ 请访问 https://docs.conda.io/en/latest/miniconda.html 下载安装")
-    print("  └──────────────────────────────────────────────────")
+        # 场景 4: 环境存在但未激活
+        print(f"  [发现] {CONDA_ENV_NAME} 环境已存在，但当前未激活")
+        print(f"  当前环境: '{current_env}'" if current_env else "  当前环境: 无 (base)")
+        print()
 
-
-def _print_conda_create_guide():
-    """输出创建 conda 虚拟环境的命令。"""
-    system = platform.system()
-    python_cmd = "python" if system == "Windows" else "python3"
-    print(f"  ┌─ 一键创建 {CONDA_ENV_NAME} 环境 ──────────────────────")
-    print(f"  │ conda create -n {CONDA_ENV_NAME} python=3.10 -y")
-    print(f"  │ conda activate {CONDA_ENV_NAME}")
-    print(f"  │ conda install ffmpeg -y")
-    print(f"  │ pip install yt-dlp opencc-python-reimplemented")
+    # ── 切换到目标环境执行 ──
+    print(f"  [切换] 自动切换到 {CONDA_ENV_NAME} 环境执行...", flush=True)
     print()
-    if system == "Windows":
-        print("  │ # CUDA 显卡:")
-        print("  │ pip install torch==2.3.1+cu121 torchvision==0.18.1 torchaudio==2.3.1 --index-url https://download.pytorch.org/whl/cu121")
-        print("  │ pip install faster-whisper funasr modelscope soundfile")
-        print("  │")
-        print("  │ # 纯 CPU:")
-        print("  │ pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu")
-        print("  │ pip install faster-whisper funasr modelscope soundfile")
-    elif system == "Darwin" and platform.machine() == "arm64":
-        print("  │ # Apple Silicon:")
-        print("  │ pip install mlx-whisper torch torchvision torchaudio funasr modelscope soundfile")
-    else:
-        print("  │ # CPU/Intel:")
-        print("  │ pip install faster-whisper torch torchvision torchaudio funasr modelscope soundfile")
-    print("  └──────────────────────────────────────────────────")
+    print("=" * 70)
+    print()
 
+    script_args = sys.argv[1:] if len(sys.argv) > 1 else []
+    _relaunch_in_env(CONDA_ENV_NAME, script_args)
 
-def _print_conda_activate_guide():
-    """输出 conda 环境激活命令。"""
-    system = platform.system()
-    if system == "Windows":
-        print(f"  > conda activate {CONDA_ENV_NAME}")
-    else:
-        print(f"  $ conda activate {CONDA_ENV_NAME}")
+    return True
 
 
 # ============ P0: Cookie 自动加载 ============
@@ -200,14 +440,18 @@ def check_and_load_cookie():
         return True
 
     print("  [注意] 未检测到 cookie.txt 文件")
-    print("  ┌─ Cookie 配置步骤（B站防403限制）───────────────")
-    print("  │ 1. 浏览器安装插件: 'Get Cookies LOCAL'")
-    print("  │ 2. 打开 https://www.bilibili.com")
-    print("  │ 3. 点击插件图标，导出 cookies 为 txt 格式")
-    print("  │ 4. 将文件重命名为 cookie.txt")
-    print("  │ 5. 放置到脚本同级目录")
-    print("  │ 6. 脚本启动自动加载，无需传入 --cookie 参数")
-    print("  └──────────────────────────────────────────────")
+    print("  ╔══════════════════════════════════════════════════╗")
+    print("  ║  下载B站视频需要 Cookie 文件！                   ║")
+    print("  ║  否则会遇到 HTTP 412 错误。                    ║")
+    print("  ╠══════════════════════════════════════════════════╣")
+    print("  ║  1. 浏览器安装插件: 'Get Cookies LOCAL'         ║")
+    print("  ║  2. 打开 https://www.bilibili.com               ║")
+    print("  ║  3. 点击插件图标 → 导出 cookies 为 txt 格式    ║")
+    print("  ║  4. 重命名为 cookie.txt                          ║")
+    print("  ║  5. 放到脚本同级目录                             ║")
+    print("  ║  6. 脚本自动加载，无需传参                      ║")
+    print("  ╚══════════════════════════════════════════════════╝")
+    print()
     return False
 
 
@@ -584,7 +828,7 @@ def get_ffmpeg_env():
 
 def check_subtitles(video_url, env=None):
     """检查视频是否有可用字幕，返回字幕语言列表"""
-    cmd = f'yt-dlp --list-subs "{video_url}"'
+    cmd = _yt_cmd(f'yt-dlp --list-subs "{video_url}"')
     success, stdout, stderr = run_command(cmd, env=env, timeout=30)
     if not success or not stdout:
         return []
@@ -623,8 +867,8 @@ def check_subtitles(video_url, env=None):
 def extract_subtitles(video_url, output_dir, env=None):
     """提取视频字幕，返回字幕文件路径"""
     for lang in ['zh-CN', 'zh-Hans', 'zh']:
-        cmd = f'yt-dlp --write-subs --sub-langs {lang} --skip-download ' \
-              f'-o "{output_dir}/%(title)s.%(ext)s" "{video_url}"'
+        cmd = _yt_cmd(f'yt-dlp --write-subs --sub-langs {lang} --skip-download ' \
+              f'-o "{output_dir}/%(title)s.%(ext)s" "{video_url}"')
         success, stdout, stderr = run_command(cmd, env=env, timeout=60)
         if success:
             for ext in ['.srt', '.vtt', '.json', '.ass']:
@@ -702,7 +946,7 @@ def parse_vtt(vtt_path):
 
 def extract_video_info(video_url, env=None):
     """提取视频信息"""
-    cmd = f'yt-dlp --dump-json --no-download "{video_url}"'
+    cmd = _yt_cmd(f'yt-dlp --dump-json --no-download "{video_url}"')
     success, stdout, stderr = run_command(cmd, env=env, timeout=30)
 
     if not success or not stdout:
@@ -729,8 +973,8 @@ def download_audio(video_url, output_dir, env=None):
     print(f"[下载] 正在下载音频...", flush=True)
 
     output_template = str(output_dir / "%(title)s.%(ext)s")
-    cmd = f'yt-dlp -x --audio-quality 0 --quiet --no-warnings ' \
-          f'-o "{output_template}" "{video_url}"'
+    cmd = _yt_cmd(f'yt-dlp -x --audio-quality 0 --quiet --no-warnings ' \
+          f'-o "{output_template}" "{video_url}"')
 
     success, stdout, stderr = run_command(cmd, env=env, timeout=600)
 
@@ -1466,7 +1710,7 @@ def get_channel_videos(channel_url, limit=None, env=None):
     """获取 UP 主的所有视频链接"""
     print(f"[信息] 获取 UP 主视频列表: {channel_url}")
 
-    cmd = f'yt-dlp --flat-playlist --print id "{channel_url}"'
+    cmd = _yt_cmd(f'yt-dlp --flat-playlist --print id "{channel_url}"')
     success, stdout, stderr = run_command(cmd, env=env, timeout=120)
 
     if not success:
@@ -1506,19 +1750,14 @@ def print_task_summary(start_time, total, success_count, failed_list, output_dir
 
 
 def main():
-    global MODEL_RELEASE_INTERVAL, _cached_model, _cached_model_key
-
+    global MODEL_RELEASE_INTERVAL, _cached_model, _cached_model_key, PIP_MIRROR
+    """
+    主流程。
+    注意：conda 检测、环境汇总、cookie 加载等前置检查已在 _entry_startup_checks() 中完成，
+    此处不再重复执行。
+    """
     # ========== 启动时间 ==========
     script_start_time = time.time()
-
-    # ========== P0: Conda 环境检测 ==========
-    check_conda_env()
-
-    # ========== P0: 启动全量环境自检汇总 ==========
-    print_env_summary()
-
-    # ========== P0: Cookie 自动加载 ==========
-    check_and_load_cookie()
 
     # ========== 参数解析 ==========
     parser = argparse.ArgumentParser(description="B站视频批量转写 Pipeline")
@@ -1545,9 +1784,14 @@ def main():
     parser.add_argument("--transcribe-only", help="仅转写指定音频文件（跳过下载）")
     parser.add_argument("--extract-audio", help="仅从本地视频提取音频，不执行转写")
     parser.add_argument("--cookie", help="yt-dlp Cookie 文件路径（如已放置 cookie.txt 则自动加载）")
+    parser.add_argument("--pip-mirror", default=PIP_MIRROR,
+                        help=f"pip 镜像源（默认 {PIP_MIRROR}，置空 '' 则用官方 PyPI）")
     parser.add_argument("--release-interval", type=int, default=MODEL_RELEASE_INTERVAL,
                         help=f"每处理N个视频释放模型（默认{MODEL_RELEASE_INTERVAL}）")
     args = parser.parse_args()
+
+    # 将 --pip-mirror 写入全局配置（默认已设为清华源，用户可覆盖或置空用官方源）
+    PIP_MIRROR = args.pip_mirror
 
     # ========== P0: 硬件自动适配最优参数 ==========
     args = detect_hardware_and_optimize(args)
@@ -1757,5 +2001,78 @@ def main():
     print(f"[完成] 所有任务执行完毕")
 
 
+def _entry_startup_checks():
+    """
+    前置启动检查：conda 环境、环境汇总、Cookie 加载。
+    放在交互式选单之前执行，确保环境问题提前暴露，不让用户白操作。
+    """
+    check_conda_env()
+    print_env_summary()
+    check_and_load_cookie()
+
+
+def _entry_interactive_menu():
+    """无参数时弹出交互式选单，构造 sys.argv 后转 main()。"""
+    print()
+    print("=" * 70)
+    print("  B站视频批量转写 Pipeline - 交互式选单")
+    print("=" * 70)
+    print()
+    print("  请选择一个模式:")
+    print("    1. 转写 B站视频 (输入URL/BV号)")
+    print("    2. 转写本地文件 (视频/音频)")
+    print("    3. 仅从视频提取音频 (不转写)")
+    print("    4. 显示帮助信息并退出")
+    print("    0. 退出")
+    print()
+    try:
+        choice = input("  输入编号 [0-4]: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\n  已取消")
+        sys.exit(0)
+    print()
+
+    if choice == "1":
+        url = input("  请输入 B站 URL 或 BV 号: ").strip()
+        if not url:
+            print("  [错误] 输入为空")
+            sys.exit(1)
+        sys.argv = [sys.argv[0], url]
+    elif choice == "2":
+        path = input("  请输入本地文件路径: ").strip()
+        if not path:
+            print("  [错误] 输入为空")
+            sys.exit(1)
+        sys.argv = [sys.argv[0], path]
+    elif choice == "3":
+        path = input("  请输入本地视频路径: ").strip()
+        if not path:
+            print("  [错误] 输入为空")
+            sys.exit(1)
+        sys.argv = [sys.argv[0], path, "--extract-audio"]
+    elif choice == "4":
+        sys.argv = [sys.argv[0], "--help"]
+    else:
+        print("  已退出")
+        sys.exit(0)
+    print()
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        # 第一步：前置检查（conda / 环境汇总 / Cookie）—— 先于选单，避免用户白操作
+        _entry_startup_checks()
+
+        # 第二步：无参数时弹出交互式选单
+        if len(sys.argv) == 1:
+            _entry_interactive_menu()
+
+        # 第三步：执行主流程（main 内部不再重复 conda/env/cookie 检查）
+        main()
+    except KeyboardInterrupt:
+        print()
+        print("=" * 70)
+        print("  用户中断，已退出。")
+        print("=" * 70)
+        print()
+        sys.exit(130)
