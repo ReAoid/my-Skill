@@ -225,9 +225,10 @@ def _conda_install_pip_deps(env_name):
 
         if has_cuda:
             print(f"  [安装] Windows CUDA: 安装 CUDA 版 torch...", flush=True)
+            # ⚠️ 不使用 {mirror}（会覆盖 --index-url），CUDA wheel 只能从 pytorch.org 获取
             _run_with_live_output(
-                f'{prefix} pip install torch==2.3.1+cu121 torchvision==0.18.1 torchaudio==2.3.1 --index-url https://download.pytorch.org/whl/cu121{mirror}',
-                timeout=600, label="CUDA torch"
+                f'{prefix} pip install torch==2.3.1+cu121 torchvision==0.18.1 torchaudio==2.3.1 --index-url https://download.pytorch.org/whl/cu121',
+                timeout=1200, label="CUDA torch"
             )
         else:
             print(f"  [安装] Windows CPU: 安装 CPU 版 torch...", flush=True)
@@ -239,6 +240,11 @@ def _conda_install_pip_deps(env_name):
         _run_with_live_output(
             f'{prefix} pip install faster-whisper funasr modelscope soundfile{mirror}',
             timeout=600, label="faster-whisper + funasr"
+        )
+        # ⚠️ 固定 numpy<2，防止 torchaudio 在 numpy 2.x 下崩溃
+        _run_with_live_output(
+            f'{prefix} pip install "numpy<2"{mirror}',
+            timeout=120, label="固定 numpy 版本"
         )
     else:
         print(f"  [安装] 安装 faster-whisper + torch (CPU)...", flush=True)
@@ -279,9 +285,9 @@ def _auto_install_python_deps():
     except ImportError:
         missing.append("torch")
 
+    mirror = _pip_mirror_flag()
     if missing:
         pkgs_str = " ".join(missing)
-        mirror = _pip_mirror_flag()
         print(f"  [自动] 检测到缺失依赖: {', '.join(missing)}，正在安装...", flush=True)
         success, _ = _run_with_live_output(
             f"pip install {pkgs_str}{mirror}",
@@ -291,6 +297,11 @@ def _auto_install_python_deps():
             print("  [OK] 依赖安装完成", flush=True)
         else:
             print("  [警告] 部分依赖安装可能失败，请检查上方输出", flush=True)
+    # ⚠️ 固定 numpy<2，防止 torchaudio 在 numpy 2.x 下崩溃
+    _run_with_live_output(
+        f"pip install 'numpy<2'{mirror}",
+        timeout=120, label="固定 numpy 版本"
+    )
 
 
 def _relaunch_in_env(env_name, script_args):
@@ -622,7 +633,7 @@ def print_dependency_install_guide(missing_dep):
         "yt-dlp": "pip install yt-dlp",
         "mlx-whisper": "pip install mlx-whisper",
         "faster-whisper": "pip install faster-whisper",
-        "funasr": "pip install funasr modelscope soundfile",
+        "funasr": "pip install funasr modelscope soundfile && pip install 'numpy<2'",
         "opencc": "pip install opencc-python-reimplemented",
         "torch": "",
     }
@@ -1344,12 +1355,63 @@ def transcribe_with_funasr(audio_path, model_name=DEFAULT_FUNASR_MODEL,
 
 # ============ P1: 模型双层降级容错 ============
 
+def _is_network_error(e):
+    """检查异常是否为网络连接错误（HuggingFace 被墙/超时等）。"""
+    msg = str(e).lower()
+    keywords = [
+        "connecttimeout", "connectionerror", "connect failed",
+        "timeout", "winerror 10060", "winerror 10061",
+        "cannot connect", "connection refused", "network",
+        "no route to host", "getaddrinfo", "name or service not known",
+        "max retries exceeded", "remote end closed connection",
+        "reset by peer", "eof", "cannot resolve",
+    ]
+    return any(k in msg for k in keywords)
+
+
+def _ensure_funasr_installed():
+    """检查 FunASR 是否已安装，未安装则自动安装。"""
+    try:
+        from funasr import AutoModel  # noqa: F401
+        import soundfile  # noqa: F401
+        return True
+    except ImportError:
+        print()
+        print("  ╔══════════════════════════════════════════════════════════╗")
+        print("  ║  [自动安装] FunASR 未安装，正在自动安装...               ║")
+        print("  ║  安装来源: ModelScope (阿里达摩院)，国内直连             ║")
+        print("  ╚══════════════════════════════════════════════════════════╝")
+        print(flush=True)
+
+        mirror = _pip_mirror_flag()
+        success, _ = _run_with_live_output(
+            f"pip install funasr modelscope soundfile{mirror}",
+            timeout=600,
+            label="安装 FunASR"
+        )
+        if success:
+            print("  [OK] FunASR 安装完成", flush=True)
+            # ⚠️ 固定 numpy<2，防止 torchaudio 在 numpy 2.x 下崩溃
+            _run_with_live_output(
+                f"pip install 'numpy<2'{mirror}",
+                timeout=120,
+                label="固定 numpy 版本"
+            )
+            print()
+            return True
+        print("  [错误] FunASR 自动安装失败，请手动运行:", flush=True)
+        print(f"  pip install funasr modelscope soundfile{mirror}", flush=True)
+        print(f"  pip install 'numpy<2'{mirror}", flush=True)
+        print()
+        return False
+
+
 def _try_transcribe_with_fallback(audio_path, model_size, compute_type, engine,
                                     funasr_model, funasr_device):
     """
-    转写统一入口，内置双层降级容错：
+    转写统一入口，内置双层降级容错 + 网络故障自愈：
     1. large/medium 下载失败 → 自动降级 small/tiny
-    2. Whisper 全部失败 → 自动回退 FunASR
+    2. Whisper 全部失败（网络问题）→ 自动安装 FunASR + 回退
     3. FunASR 失败 → 自动切回 Whisper
     """
     model_sizes_fallback = ["large", "medium", "small", "tiny"]
@@ -1357,6 +1419,7 @@ def _try_transcribe_with_fallback(audio_path, model_size, compute_type, engine,
 
     # 尝试 Whisper 系列
     if engine in ("whisper", "auto"):
+        network_failure = False
         for try_model in current_models:
             try:
                 if is_apple_silicon():
@@ -1369,14 +1432,56 @@ def _try_transcribe_with_fallback(audio_path, model_size, compute_type, engine,
                     method = f"Faster Whisper ({try_model}, {compute_type})"
                 return data, method
             except Exception as e:
+                if _is_network_error(e):
+                    network_failure = True
                 if try_model != current_models[-1]:
                     print(f"[降级] {try_model} 模型失败，自动降级到更小模型: {e}", flush=True)
                 else:
                     print(f"[警告] Whisper 全部模型均失败: {e}", flush=True)
 
-        # Whisper 全部失败，auto 模式回退 FunASR
-        if engine == "auto":
-            print("[回退] Whisper 全部失败，自动回退 FunASR...", flush=True)
+        # ── Whisper 全部失败 ──
+        if network_failure:
+            # 网络问题：提示 + 自动安装 FunASR + 回退
+            print()
+            print("  ╔══════════════════════════════════════════════════════════╗")
+            print("  ║  [网络错误] 无法连接到 HuggingFace 下载 Whisper 模型     ║")
+            print("  ║  HuggingFace 在国内被墙，Whisper 模型下载失败           ║")
+            print("  ║  解决方案：自动切换至 FunASR (阿里达摩院中文引擎)        ║")
+            print("  ║  FunASR 模型托管在 ModelScope，国内直连无墙             ║")
+            print("  ╚══════════════════════════════════════════════════════════╝")
+            print(flush=True)
+
+            if _ensure_funasr_installed():
+                print("[回退] 自动切换到 FunASR 进行转写...", flush=True)
+                try:
+                    device = choose_funasr_device(funasr_device)
+                    data = transcribe_with_funasr(audio_path, model_name=funasr_model, device=device)
+                    method = f"FunASR (网络回退, {funasr_model}, {device})"
+                    return data, method
+                except Exception as e:
+                    print(f"[错误] FunASR 回退也失败: {e}", flush=True)
+                    raise
+            else:
+                # FunASR 安装失败，给出手动指引
+                print()
+                print("  ╔══════════════════════════════════════════════════════════╗")
+                print("  ║  [解决步骤]                                             ║")
+                print("  ║                                                         ║")
+                print("  ║  1. 安装 FunASR（国内直连，无需翻墙）：                 ║")
+                print("  ║     pip install funasr modelscope soundfile              ║")
+                print("  ║                                                         ║")
+                print("  ║  2. 使用 FunASR 引擎重跑：                              ║")
+                print(f"  ║     python bilibili_pipeline.py <URL/BV> --engine funasr  ║")
+                print("  ║                                                         ║")
+                print("  ║  3. 或者设置 HuggingFace 镜像源（需要能访问 hf-mirror）： ║")
+                print("  ║     set HF_ENDPOINT=https://hf-mirror.com               ║")
+                print("  ║     python bilibili_pipeline.py <URL/BV>                 ║")
+                print("  ╚══════════════════════════════════════════════════════════╝")
+                print(flush=True)
+                raise RuntimeError("Whisper 因网络问题全部失败，且 FunASR 自动安装失败，请手动安装后重试。")
+        elif engine == "auto":
+            # 非网络错误，但 auto 模式仍然回退
+            print("[回退] Whisper 全部失败，尝试回退 FunASR...", flush=True)
             try:
                 device = choose_funasr_device(funasr_device)
                 data = transcribe_with_funasr(audio_path, model_name=funasr_model, device=device)
@@ -1386,6 +1491,7 @@ def _try_transcribe_with_fallback(audio_path, model_size, compute_type, engine,
                 print(f"[错误] FunASR 回退也失败: {e}", flush=True)
                 raise
         else:
+            # engine == "whisper" + 非网络错误：直接报错
             raise
 
     # engine == "funasr"
