@@ -31,7 +31,7 @@ disable-model-invocation: true
 - 不存在跨模块、接口、数据结构变更
 
 典型场景：Bug 修复、样式调整、参数修改、单文件逻辑纠错、注释或文案修正。
-配套文档：`references/dev-plan.md`
+配套文档：`dev-flow-lite/references/dev-plan.md`
 
 ### 复杂任务（完整规范模式）
 判定条件：
@@ -41,7 +41,7 @@ disable-model-invocation: true
 - 包含业务逻辑重构、架构调整、跨模块联调
 
 典型场景：新功能开发、接口改造、数据结构变更、多文件迭代、架构优化。
-配套文档：`references/dev-spec.md`
+配套文档：`dev-flow-lite/references/dev-spec.md`
 
 ---
 
