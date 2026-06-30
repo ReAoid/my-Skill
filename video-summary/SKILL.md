@@ -19,47 +19,119 @@ description: >
   ↓
 1. 解析意图：单个视频 / UP主批量 / 本地媒体文件
   ↓
-2. 网络视频先检查字幕：yt-dlp --list-subs
-   ├── 有字幕 → 直接提取（秒级完成）
-   └── 无字幕 → 下载原始音频 → Whisper 转写（实时进度报告）
-   本地视频 → ffmpeg 无损提取音轨 → Whisper 转写
+2. Conda 环境检测 → 环境自检汇总 → Cookie 自动加载 → 硬件自动适配
   ↓
-3. 输出结构化 TXT（元信息 + 完整文本 + 带时间戳分段）
+3. 网络视频先检查字幕：yt-dlp --list-subs
+   ├── 有字幕 → 直接提取（秒级完成）
+   └── 无字幕 → 下载原始音频 → ASR 转写（实时进度报告）
+   本地视频 → ffmpeg 无损提取音轨 → ASR 转写
+  ↓
+4. 输出结构化 TXT（元信息 + 完整文本 + 带时间戳分段）
+  ↓
+5. 任务结束全局统计汇总（成功/失败/耗时）
+```
+
+---
+
+## 环境规范
+
+**本工具仅支持 Anaconda/Miniconda 虚拟环境运行**，原生 python venv 不再提供支持。
+脚本启动时自动校验 conda 环境，非 conda 环境会输出红色警告并引导安装。
+
+### 虚拟环境（固定名称 `bilibili_trans`）
+
+```bash
+# 创建环境，指定 Python 3.10
+conda create -n bilibili_trans python=3.10 -y
+
+# 激活环境
+conda activate bilibili_trans
+
+# 安装基础依赖
+conda install ffmpeg -y
+pip install yt-dlp opencc-python-reimplemented
+```
+
+### 按系统安装 GPU 依赖
+
+#### Windows NVIDIA CUDA 显卡
+```powershell
+pip install torch==2.3.1+cu121 torchvision==0.18.1 torchaudio==2.3.1 --index-url https://download.pytorch.org/whl/cu121
+pip install faster-whisper funasr modelscope soundfile
+```
+
+> GTX16xx 老显卡：脚本运行时**自动**强制关闭 FP16，使用 int8 量化提速
+
+#### Windows 纯 CPU
+```powershell
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+pip install faster-whisper funasr modelscope soundfile
+```
+
+#### macOS Apple Silicon (M系列)
+```bash
+pip install mlx-whisper torch torchvision torchaudio funasr modelscope soundfile
+```
+
+#### macOS Intel（仅 CPU 慢速运行）
+```bash
+pip install faster-whisper torch torchvision torchaudio funasr modelscope soundfile
 ```
 
 ---
 
 ## 依赖项
 
-执行前必须确认以下依赖已安装：
+| 依赖 | 必需 | 说明 |
+|------|------|------|
+| yt-dlp | 是 | B站视频/字幕下载 |
+| mlx-whisper | Apple Silicon | Metal GPU 加速转写 |
+| faster-whisper | Windows/备选 | CUDA/CPU 转写 |
+| ffmpeg | 是 | 音频提取（conda install ffmpeg） |
+| opencc-python-reimplemented | 推荐 | 繁简转换 |
+| torch | 推荐 | GPU 加速支持 |
+| funasr / modelscope / soundfile | 备用 | 中文备用引擎 |
 
-| 依赖 | 安装命令 | 必需 |
-|------|---------|------|
-| yt-dlp | `pip install yt-dlp` | 是 |
-| mlx-whisper | `pip install mlx-whisper` | 是（Apple Silicon）/ 否（Windows） |
-| faster-whisper | `pip install faster-whisper` | 是（Windows）/ 备选（macOS） |
-| ffmpeg | 本地便携版或系统安装 | 是 |
-| opencc | `pip install opencc-python-reimplemented` | 推荐 |
-| torch (CUDA) | 参见踩坑经验 | 推荐（Windows GPU） |
-| funasr / modelscope / soundfile / torchaudio | `python3 -m pip install --user funasr modelscope soundfile torchaudio` | 备用（中文识别） |
+脚本启动时会自动输出**全量环境自检汇总面板**，包含：
+- 系统信息与 Conda 环境
+- yt-dlp / ffmpeg 状态
+- CUDA / MPS 加速状态
+- Whisper 引擎（mlx-whisper / faster-whisper）可用性
+- FunASR 可用性
 
-### 环境检查命令
+依赖缺失时，脚本会自动识别操作系统并输出对应的**一键安装命令**（区分 CUDA/CPU/MPS 版 torch）。
+
+---
+
+## Cookie 配置（B站防 403 限制）
+
+脚本启动时**自动检测** `./cookie.txt`，存在则自动注入 yt-dlp，无需手动传参 `--cookie`。
 
 ```bash
-yt-dlp --version
-python -c "import mlx_whisper; print('mlx-whisper: OK')"  # Apple Silicon
-python -c "from faster_whisper import WhisperModel; print('OK')"  # Windows/备选
-python -c "from funasr import AutoModel; print('FunASR: OK')"  # 中文备用
-python -c "import torch; print('CUDA:', torch.cuda.is_available())"
-ffmpeg -version
+# 将 cookie.txt 放在脚本同级目录，启动自动加载
+python -u <skill_dir>/scripts/bilibili_pipeline.py "视频URL"
 ```
 
-### macOS (Apple Silicon) 注意事项
+如果文件缺失，脚本会自动打印 Cookie 导出配置步骤：
+1. 浏览器安装插件：**Get Cookies LOCAL**
+2. 打开 B 站主页，导出 cookies 为 txt 格式
+3. 重命名为 `cookie.txt`，放置到脚本目录
 
-- **优先使用 mlx-whisper**：faster-whisper 的 ctranslate2 不支持 Apple GPU，只能跑 CPU，极慢
-- mlx-whisper 使用 Metal GPU 加速，28分钟视频约3-4分钟完成
-- 模型仓库：`mlx-community/whisper-small-mlx`、`mlx-community/whisper-medium-mlx`
-- 首次使用需从 HuggingFace 下载模型
+---
+
+## 硬件自动适配
+
+脚本启动时自动检测硬件并**自动优化运行参数**：
+
+| 硬件 | 自动优化 |
+|------|---------|
+| Apple Silicon (M1/M2/M3/M4) | 锁定 mlx-whisper (Metal GPU)，禁用 faster-whisper |
+| Windows GTX 16xx / GTX 10xx | 强制关闭 FP16，int8 量化 |
+| Windows 新架构 GPU | 提示可使用 medium/large 大模型 |
+| 纯 CPU | 提示使用 tiny/base 轻量模型 |
+| 所有平台 | 默认开启 `--cleanup-audio`，默认模型固定 `small` |
+
+脚本还会输出详细的**硬件优化建议**，帮助用户了解当前配置的最佳实践。
 
 ---
 
@@ -85,8 +157,23 @@ ffmpeg -y -i "input.mp4" -vn -c:a copy "output.m4a"
 
 **重要**：
 - 默认不限制处理数量（处理全部视频）
-- 视频超过20个时，**先提示用户确认**，告知预计耗时
-- 支持用户指定范围，如"最新的10个"、"前5个"
+- 视频超过20个时，**脚本自动弹出交互确认**，告知预计耗时，用户输入 y/n
+- 支持用户指定范围，如 `--limit 10`
+
+### Step 1b：Conda 环境检测（自动执行）
+
+脚本启动时自动：
+1. 检测系统是否存在 `conda` 命令，未检测到则输出 Miniconda 完整安装步骤
+2. 读取 `CONDA_DEFAULT_ENV`，非 conda 环境输出警告并引导
+3. 检测到 conda 但未创建环境时，自动输出全套创建/激活/安装指令
+
+### Step 1c：Cookie 自动加载（自动执行）
+
+脚本启动时自动检测 `./cookie.txt` 和脚本同级 `cookie.txt`，存在即加载。
+
+### Step 1d：硬件检测与自动适配（自动执行）
+
+脚本启动时自动检测硬件，适配最优参数，无需外部传参。
 
 ### Step 2：字幕优先策略
 
@@ -96,65 +183,40 @@ ffmpeg -y -i "input.mp4" -vn -c:a copy "output.m4a"
 yt-dlp --list-subs "视频URL"
 ```
 
-- 如果有 `zh-CN` / `zh-Hans` / `zh` 字幕 → 直接提取：
-  ```bash
-  yt-dlp --write-subs --sub-langs zh-CN --skip-download -o "输出路径" "视频URL"
-  ```
-  然后将 `.srt` 或 `.json` 字幕文件转为 Markdown
-
+- 如果有 `zh-CN` / `zh-Hans` / `zh` 字幕 → 直接提取
 - 如果只有弹幕（danmaku）或无字幕 → 走下载+转写路线
 
 ### Step 3：下载或提取音频（无字幕/本地视频时）
 
-网络视频保留原始音频格式，不主动转 mp3：
+网络视频保留原始音频格式，不主动转 mp3。
 
-```bash
-yt-dlp -x --audio-quality 0 -o "输出路径" "视频URL"
+### Step 4：ASR 转写（带双层降级容错）
+
+脚本内置**双层降级容错机制**：
+
+**第一层 - 模型大小降级**：
+- large/medium 模型下载/加载失败 → 自动降级 small → tiny
+- 确保即使在资源受限环境下也能完成转写
+
+**第二层 - 引擎切换降级**：
+- Whisper (mlx-whisper/faster-whisper) 全部失败 → 自动回退 FunASR
+- FunASR 加载失败 → 自动切回 Whisper
+- 提供最大容错保障
+
+实时进度报告（每5秒输出百分比、已处理时间、片段数、预计剩余时间）。
+
+### Step 4b：长视频超时风险提示
+
+单视频时长 > 900 秒（15分钟），脚本**自动打印超时风险提示**，建议在本地终端手动运行避免进程被杀：
+
 ```
-
-本地视频直接交给脚本，脚本会自动提取音频并转写：
-
-```bash
-python -u <skill_dir>/scripts/bilibili_pipeline.py "本地视频.mp4"
-```
-
-### Step 4：Faster Whisper 转写
-
-使用脚本执行转写，**实时报告进度**（每5秒输出：百分比、已处理时间、片段数、预计剩余时间）：
-
-```bash
-python <skill_dir>/scripts/bilibili_pipeline.py --transcribe-only "音频路径"
-```
-
-默认配置：
-- 模型：`small`
-- 量化：`int8`
-- 设备：`cuda`（不可用时回退到 `cpu`）
-- 语言：`zh`
-
-### Step 4b：FunASR 备用转写（Apple Silicon 默认 MPS）
-
-默认仍使用 Whisper / mlx-whisper。需要中文备用识别时显式加 `--engine funasr`：
-
-```bash
-python3 -u <skill_dir>/scripts/bilibili_pipeline.py --transcribe-only "音频路径" --engine funasr
-python3 -u <skill_dir>/scripts/bilibili_pipeline.py "视频URL" --engine funasr
-python3 -u <skill_dir>/scripts/bilibili_pipeline.py "视频URL" --engine auto
-```
-
-FunASR 默认模型为 `paraformer-zh`，并启用 `fsmn-vad` 与 `ct-punc-c`。`--funasr-device auto` 会优先使用 CUDA；Apple Silicon 上优先使用 `mps`；不可用时回退 CPU。首次运行会从 ModelScope 下载模型到 `~/.cache/modelscope/`，之后可复用本地缓存。
-
-可手动指定设备：
-
-```bash
-python3 -u <skill_dir>/scripts/bilibili_pipeline.py "视频URL" --engine funasr --funasr-device mps
-python3 -u <skill_dir>/scripts/bilibili_pipeline.py "视频URL" --engine funasr --funasr-device cpu
-```
-
-进度输出示例：
-```
-[进度]  24.4% | 已处理 87s / 356s | 片段数: 28, 预计剩余 0分46秒
-[进度] 100.0% | 转写完成 | 用时 0分49秒 | 共 126 个片段
+  ╔══════════════════════════════════════════════════════════╗
+  ║  [长视频警告]                                          ║
+  ║  当前视频时长: 73分24秒 (4404.0s)                      ║
+  ║  超过15分钟阈值，转写可能需要较长时间                   ║
+  ║                                                         ║
+  ║  建议: 在本地终端手动运行，避免进程超时被 kill          ║
+  ╚══════════════════════════════════════════════════════════╝
 ```
 
 ### Step 5：输出结构化 TXT
@@ -189,21 +251,44 @@ SEGMENT_COUNT: 120
 - `TIMESTAMPS` 区提供带时间戳的分段，便于定位原始内容
 - 不由脚本生成 Markdown，交由 AI 根据需要自行加工
 
----
+### Step 6：任务结束全局统计汇总
 
-## 输出目录
-
-默认输出到当前工作目录下的 `bilibili_output/`：
+批量任务处理完成后，脚本自动输出统计汇总：
 
 ```
-bilibili_output/
+============================================================
+  [任务统计] 执行完成汇总
+============================================================
+  总视频数:     12
+  成功:         11
+  失败:         1
+  失败列表:     BV1xx411c7mD
+  总运行耗时:   35分28秒
+  输出目录:     /path/to/bilibili_output
+============================================================
+```
+
+---
+
+## 输出目录（自适应规则）
+
+| 输入类型 | 默认输出目录 |
+|---------|------------|
+| B站单视频 | `./bilibili_output/BVxxx/` |
+| UP主批量 | `./bilibili_output/BVxxx/`（统一在 bilibili_output 下） |
+| 本地文件 | `原文件名_transcribe/`（与文件同目录） |
+| `--output-dir` 自定义 | 按用户指定路径 |
+
+```
+bilibili_output/                     # B站视频输出
 ├── BV1xxxxxx/
-│   ├── 视频标题.m4a      # 音频文件（可选保留，优先原始格式）
-│   └── 视频标题.txt       # 转写 TXT
-├── BV2xxxxxx/
-│   └── 视频标题.txt       # 有字幕时无音频文件
-├── progress.json          # 断点续传进度
+│   ├── 视频标题.txt
+│   └── 视频标题.m4a
+├── progress.json
 └── ...
+
+本地视频.mp4 → 本地视频_transcribe/  # 本地文件输出
+                └── 本地视频.txt
 ```
 
 ---
@@ -224,27 +309,20 @@ bilibili_output/
 
 ---
 
-## 调用方式（重要）
-
-**不要使用 `2>&1` 重定向**，直接运行即可，`-u` 参数禁用 Python 缓冲：
-
-```powershell
-python -u "<skill_dir>/scripts/bilibili_pipeline.py" "视频URL"
-```
-
-原因：PowerShell 的 `2>&1` 会将 stderr 编码为 CLIXML 格式，导致输出解析失败。脚本已内置 `sys.stderr = sys.stdout`，所有错误自动走 stdout。
-
 ## 脚本调用方式
 
+脚本已实现**完全独立运行**，无需 Agent 拼接命令，所有参数均有安全默认值：
+
 ```bash
-# 处理单个视频
+# 最简单的用法（自动检测一切）
 python -u <skill_dir>/scripts/bilibili_pipeline.py "https://www.bilibili.com/video/BV1xxxxxx/"
 
-# 批量处理UP主视频（全部）
-python -u <skill_dir>/scripts/bilibili_pipeline.py "https://space.bilibili.com/123456"
-
-# 批量处理UP主视频（前10个）
+# 批量处理UP主视频
 python -u <skill_dir>/scripts/bilibili_pipeline.py "https://space.bilibili.com/123456" --limit 10
+
+# 处理本地文件（自动识别类型）
+python -u <skill_dir>/scripts/bilibili_pipeline.py "本地视频.mp4"
+python -u <skill_dir>/scripts/bilibili_pipeline.py "本地音频.m4a"
 
 # 指定输出目录
 python -u <skill_dir>/scripts/bilibili_pipeline.py "视频URL" --output-dir "./my_output"
@@ -253,29 +331,22 @@ python -u <skill_dir>/scripts/bilibili_pipeline.py "视频URL" --output-dir "./m
 python -u <skill_dir>/scripts/bilibili_pipeline.py "视频URL" --model base
 
 # 使用 FunASR 中文备用识别
-python3 -u <skill_dir>/scripts/bilibili_pipeline.py "视频URL" --engine funasr
-
-# Apple Silicon 上显式使用 MPS
-python3 -u <skill_dir>/scripts/bilibili_pipeline.py "视频URL" --engine funasr --funasr-device mps
+python -u <skill_dir>/scripts/bilibili_pipeline.py "视频URL" --engine funasr
 
 # Whisper 失败时自动回退 FunASR
-python3 -u <skill_dir>/scripts/bilibili_pipeline.py "视频URL" --engine auto
+python -u <skill_dir>/scripts/bilibili_pipeline.py "视频URL" --engine auto
 
-# 不保留音频文件
-python -u <skill_dir>/scripts/bilibili_pipeline.py "视频URL" --cleanup-audio
+# 不保留音频文件（默认开启）
+python -u <skill_dir>/scripts/bilibili_pipeline.py "视频URL" --no-cleanup-audio
 
 # 仅转写已有音频
 python -u <skill_dir>/scripts/bilibili_pipeline.py --transcribe-only "音频路径"
 
-# 处理本地视频：自动无损提取音轨并转写
-python -u <skill_dir>/scripts/bilibili_pipeline.py "本地视频.mp4"
-
 # 仅从本地视频提取音频，不转写
-python -u <skill_dir>/scripts/bilibili_pipeline.py --extract-audio "本地视频.mp4" --output-dir "./输出目录"
-
-# 指定本地视频/音频输出目录
-python -u <skill_dir>/scripts/bilibili_pipeline.py "本地视频.mp4" --output-dir "./输出目录"
+python -u <skill_dir>/scripts/bilibili_pipeline.py --extract-audio "本地视频.mp4"
 ```
+
+**重要**：不要使用 `2>&1` 重定向，直接运行即可。`-u` 参数禁用 Python 缓冲。
 
 ---
 
@@ -284,7 +355,7 @@ python -u <skill_dir>/scripts/bilibili_pipeline.py "本地视频.mp4" --output-d
 这次处理 73分24秒本地 mp4 的经验：
 
 - 源视频音轨本身是 AAC，最优方式是 `ffmpeg -vn -c:a copy` 直接抽成 `.m4a`，实际约 38 秒完成；误用 AAC 重编码会慢很多。
-- 不要为了“通用”先转 mp3。mp3 转码多一步损耗，长视频还有截断和耗时风险；Whisper 可以直接吃 `.m4a`。
+- 不要为了"通用"先转 mp3。mp3 转码多一步损耗，长视频还有截断和耗时风险；Whisper 可以直接吃 `.m4a`。
 - Apple Silicon 上优先用 `mlx-whisper`，`small` 模型转写 73 分钟音频约 11 分钟，输出 2577 个片段，速度正常。
 - `mlx-whisper` 的进度主要来自底层 tqdm frames，不一定每 5 秒输出标准 `[进度]` 行；看到 frames 百分比持续变化就是正常运行。
 - FunASR 已作为备用引擎接入，默认不抢占 mlx-whisper；中文素材可用 `--engine funasr` 对比效果，或用 `--engine auto` 做失败回退。
@@ -296,28 +367,36 @@ python -u <skill_dir>/scripts/bilibili_pipeline.py "本地视频.mp4" --output-d
 
 ## 注意事项
 
-1. **FFmpeg 路径**：如果 ffmpeg 不在系统 PATH 中，脚本会自动检测当前工作目录下的 `ffmpeg-master-latest-win64-gpl/bin/`
-2. **CUDA vs CPU**：脚本自动检测 CUDA 可用性，不可用时回退到 CPU（速度慢10-20倍）
-3. **GTX 1650 优化**：使用 int8 量化 + FP32 模式（`--fp16 False`），比默认 FP16 更快
-4. **Windows 编码**：脚本避免使用 emoji，使用 `[OK]` `[错误]` 等文本标记
-5. **网络问题**：B站下载可能需要代理或 Cookie，支持 `--cookie` 参数
-6. **长时间运行**：批量处理多个视频时，建议告知用户预计耗时（约3-5分钟/视频 for 30分钟视频+GPU）
-7. **转写耗时**：28分钟视频约3分钟（GPU），属于正常；脚本每5秒输出进度，不要因为长时间运行就中断命令
-8. **输出缓冲**：脚本已设置 `sys.stdout.reconfigure(line_buffering=True)` 和 `flush=True`，确保进度信息实时输出
-9. **音频格式**：下载或提取音频时优先保留原始 m4a/aac/opus，不要主动转 mp3（重编码慢、可能截断长视频）
-10. **长视频命令超时**：WorkBuddy 的命令执行有超时机制，长视频（>15分钟）转写可能超时被 kill。建议长视频在终端手动运行
-11. **本地 mp4 提取音频**：先用 `-c:a copy`，失败后再转 AAC；不要一上来 `-b:a 192k` 重编码
+1. **Conda 强制要求**：脚本启动强制检测 Conda 虚拟环境，必须激活 `bilibili_trans` 环境才能运行
+2. **Cookie 自动加载**：`cookie.txt` 放在脚本目录自动生效，无需手动传入 `--cookie`
+3. **硬件自动适配**：脚本自动检测硬件，自动优化 FP16/量化/模型大小，无需外部传参
+4. **长视频保护**：>15分钟视频自动打印超时风险提示
+5. **批量确认**：>20个视频自动弹出交互确认，询问用户是否继续
+6. **模型降级容错**：双层降级保障（模型大小 + 引擎切换）
+7. **环境自检汇总**：启动时打印完整系统状态面板
+8. **依赖安装指引**：缺失依赖自动输出系统对应的一键安装命令
+9. **FFmpeg 路径**：如果 ffmpeg 不在系统 PATH 中，脚本会自动检测当前工作目录下的 `ffmpeg-master-latest-win64-gpl/bin/`
+10. **CUDA vs CPU**：脚本自动检测 CUDA 可用性，不可用时回退到 CPU（速度慢10-20倍）
+11. **GTX 1650 优化**：脚本自动检测并优化（int8 量化 + FP32）
+12. **Windows 编码**：脚本避免使用 emoji，使用 `[OK]` `[错误]` 等文本标记
+13. **长时间运行**：批量处理多个视频时，脚本自动输出预计耗时
+14. **转写耗时**：28分钟视频约3分钟（GPU），属于正常；脚本每5秒输出进度
+15. **输出缓冲**：脚本已设置 `sys.stdout.reconfigure(line_buffering=True)` 和 `flush=True`
+16. **音频格式**：下载或提取音频时优先保留原始 m4a/aac/opus，不要主动转 mp3
+17. **长视频命令超时**：>15分钟视频脚本会提示在本地终端手动运行
+18. **本地 mp4 提取音频**：先用 `-c:a copy`，失败后再转 AAC
 
 ---
 
 ## 踩坑经验
 
-- torch CUDA版安装：`pip install torch` 默认装 CPU 版，必须从 `https://download.pytorch.org/whl/cu121` 安装 CUDA 版，或手动下载 whl 文件本地安装
-- Whisper FP16 vs FP32：GTX 系列（1650等老架构）FP16 性能极弱，必须加 `--fp16 False` 或用 Faster Whisper int8 量化
+- torch CUDA版安装：`pip install torch` 默认装 CPU 版，必须从 `https://download.pytorch.org/whl/cu121` 安装 CUDA 版
+- Whisper FP16 vs FP32：GTX 系列（1650等老架构）FP16 性能极弱，脚本自动强制关闭
 - yt-dlp B站下载：需要 ffmpeg 支持音频格式转换，否则只能下载原始格式
 - Windows 终端编码：避免在 print 中使用 emoji，会导致 UnicodeEncodeError
-- faster-whisper 模型下载：首次使用需从 HuggingFace 下载模型，网络不通时需配置代理或手动下载
-- macOS Apple Silicon：faster-whisper (ctranslate2) 不支持 Apple GPU，必须用 mlx-whisper 代替，否则 CPU 跑极慢
+- faster-whisper 模型下载：首次使用需从 HuggingFace 下载模型
+- macOS Apple Silicon：faster-whisper (ctranslate2) 不支持 Apple GPU，脚本自动使用 mlx-whisper
 - mlx-whisper 模型仓库：`mlx-community/whisper-small-mlx`（不是 `whisper-small`，会401报错）
-- ffprobe 缺失：ffmpeg 便携版可能没有 ffprobe，需单独下载或用 ffmpeg -i 替代获取时长
-- 本地视频路径带中文或空格时，必须整体加引号；脚本内部使用 subprocess 参数列表处理 ffmpeg，避免 shell 转义问题
+- ffprobe 缺失：ffmpeg 便携版可能没有 ffprobe，脚本自动使用 `ffmpeg -i` 替代
+- Conda 环境创建后需重新激活：`conda activate bilibili_trans` 后再安装依赖
+- 本地视频路径带中文或空格时，必须整体加引号
